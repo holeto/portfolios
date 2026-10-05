@@ -136,6 +136,8 @@ uv run python plotting/plot_nashconv.py --config configs/<name>.yaml
   with its own config. A fork may change the training hyperparameters except `FORK_FIXED_FIELDS`
   (`train/run_config.py`: the network shapes and the seed). With unchanged hyperparameters, a fork
   continues the trajectory of the run deterministically, so finer `save_every`/`eval_every` inspects a window of it.
+  This holds on the CPU only: training on the GPU is not bit-identically reproducible, so neither are its forks
+  nor runs repeated with the same seed.
   `checkpoint.fork_name` distinguishes forks from the same step (`fork_from_S_<name>/`).
 - Numbers in configs may use scientific notation with or without a decimal point (`5e-5`, `5.0e-5`).
 - Evaluation and resuming fail if the game or the training hyperparameters (all of
@@ -144,6 +146,9 @@ uv run python plotting/plot_nashconv.py --config configs/<name>.yaml
 - HullCover runs set `train.portfolio_method: hullcover` with a `train.hullcover` section, and
   `eval.hullcover.k` (with the MILP settings). The selection is cached in `<model dir>/hullcover/step_{N}_k{k}.pkl`,
   evaluation results are saved per k as `eval/step_{N}_k{k}_{test}.json`.
+- HullCover checkpoints refer to the actor snapshots of the strategy bank by id. Each snapshot is written
+  once into `<model dir>/snapshots/{id}.pkl` (`StrategyBank.persist`, `restore`); a fork writes the snapshots
+  it holds into its own `snapshots/` folder. Checkpoints saved before hold the snapshots inline and still load.
 - Adding an evaluation test: a module in `evaluation/` with a `Config` dataclass and
   `run(solver, game, search_config, test_config, cache) -> dict`, registered in `evaluation/__init__.py`.
 - Adding a top-level package: list it under `[tool.hatch.build.targets.wheel]` in `pyproject.toml` and run `uv sync`.

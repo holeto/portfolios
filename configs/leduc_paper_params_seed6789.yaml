@@ -1,0 +1,55 @@
+# Leduc with SePoT (GCT transformations) and multi valued states, with the hyperparameters of
+# the SePoT paper. The depth limit is at the public card, as in leduc_sepot_mvs.yaml.
+# leduc_paper_params.yaml with seed 6789.
+game:
+  name: leduc
+  params: {}
+
+train:
+  steps: 75000
+  seed: 6789
+  portfolio_method: gct
+  value_type: multi_valued
+  num_transformations: 10
+  actor_network_layers: [1024, 1024]
+  critic_network_layers: [1024, 1024]
+  mvs_network_layers: [1024, 1024]
+  transformation_network_layers: [1024, 1024]
+  batch_size: 64
+  learning_rate: 3.0e-4
+  adam:
+    b1: 0.0
+    b2: 0.999
+    # 10e-8 = 1e-7, as written in the R-NaD code (the paper states 10^-8).
+    eps: 10e-8
+  clip_gradient: 10000
+  target_network_avg: 0.001
+  # The regularisation policy is updated every 500 learner steps 200 times, then every 10000.
+  entropy_schedule_size: [500, 10000]
+  entropy_schedule_repeats: [200, 1]
+  eta_reward_transform: 0.2
+  neurd_beta: 2.0
+  neurd_clip: 10000
+  c_vtrace: 1.0
+  rho_vtrace: .inf
+  # The value network ratios are not clipped either (rho_vtrace).
+  mvs_rho_vtrace: null
+
+checkpoint:
+  save: paper_params
+  save_every: 500
+  print_every: 500
+  eval_every: 500
+  resume: false
+
+eval:
+  search:
+    depth_limit: null
+    leaf_after_chances: 2
+    resolve_iterations: 800
+    resolve_every_step: false
+    prune_threshold: 1.0e-10
+  tests:
+    blueprint_exploitability: {}
+    search_exploitability:
+      leaf_values: mvs

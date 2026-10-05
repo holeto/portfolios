@@ -465,7 +465,7 @@ class RNaDSolver:
         optax.scale(-config.learning_rate),
         optax.clip(config.clip_gradient))
 
-    obs = jnp.zeros((self.game.observation_tensor_shape(),))
+    obs = jnp.zeros((self.game.information_state_tensor_shape(),))
     legal = jnp.ones((self.num_actions,))
     state = jnp.zeros((self.game.state_tensor_shape(),))
     key = jax.random.PRNGKey(config.seed)

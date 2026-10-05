@@ -66,8 +66,19 @@ def _stack(trees):
   return jax.tree.map(lambda *xs: np.stack(xs), *trees)
 
 
+# Folder in the model directory of a run with the params of the snapshots, each written once.
+SNAPSHOTS_DIR = "snapshots"
+
+
+def snapshot_path(directory: str, sid: int) -> str:
+  return os.path.join(directory, SNAPSHOTS_DIR, f"{sid}.pkl")
+
+
 class StrategyBank:
-  """Frozen actor snapshots and the base strategies defined on them."""
+  """Frozen actor snapshots and the base strategies defined on them.
+
+  The pickled bank refers to its snapshots by id: `persist` writes the params of each snapshot once
+  into the snapshots/ folder of the run, `restore` reads them back."""
 
   def __init__(self):
     self.snapshots: dict[int, dict] = {}       # snapshot id -> actor params (numpy)
@@ -75,6 +86,46 @@ class StrategyBank:
     self.bases: dict[int, tuple[int, int, int]] = {}  # base id -> (kind, snapshot a, snapshot b)
     self._next_snapshot = 0
     self._next_base = 0
+    # Snapshot ids written into the snapshots/ folder of the run in `_directory`.
+    self.persisted: set[int] = set()
+    self._directory: Optional[str] = None
+
+  def __getstate__(self):
+    state = {k: v for k, v in self.__dict__.items() if k != "_directory"}
+    state["snapshots"] = sorted(self.snapshots)
+    return state
+
+  def __setstate__(self, state):
+    self.__dict__.update(state)
+    self.persisted = set(state.get("persisted", ()))
+    self._directory = None
+    # Checkpoints from before the snapshots/ folder hold the params themselves.
+    if not isinstance(self.snapshots, dict):
+      self.snapshots = dict.fromkeys(self.snapshots)
+
+  def persist(self, directory: str):
+    """Writes the snapshots missing in the snapshots/ folder of the run in `directory`. A bank
+    restored from another run (a fork) writes all its snapshots into its own folder. Files of
+    snapshots not in `persisted` (left by an interrupted save) are overwritten."""
+    directory = os.path.abspath(directory)
+    if directory != self._directory:
+      self.persisted, self._directory = set(), directory
+    for sid, params in self.snapshots.items():
+      if sid not in self.persisted:
+        path = snapshot_path(directory, sid)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".tmp", "wb") as f:
+          pickle.dump(params, f)
+        os.replace(path + ".tmp", path)
+        self.persisted.add(sid)
+
+  def restore(self, directory: str):
+    """Reads the params of the snapshots from the snapshots/ folder of the run in `directory`."""
+    self._directory = os.path.abspath(directory)
+    for sid, params in self.snapshots.items():
+      if params is None:
+        with open(snapshot_path(directory, sid), "rb") as f:
+          self.snapshots[sid] = pickle.load(f)
 
   def add_snapshot(self, params, step: int) -> int:
     sid = self._next_snapshot

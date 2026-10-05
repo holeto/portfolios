@@ -210,6 +210,9 @@ def list_checkpoints(directory: str) -> list[int]:
 
 def save_checkpoint(solver: RNaDSolver, directory: str) -> str:
   path = checkpoint_path(directory, solver.learner_steps)
+  if solver.hullcover_state is not None:
+    # The checkpoint refers to the HullCover snapshots, written once into <directory>/snapshots/.
+    solver.hullcover_state.bank.persist(directory)
   tmp_path = path + ".tmp"
   with open(tmp_path, "wb") as f:
     pickle.dump(solver, f)
@@ -223,7 +226,10 @@ def load_checkpoint(directory: str, step: int) -> RNaDSolver:
     available = list_checkpoints(directory)
     raise FileNotFoundError(f"Checkpoint {path} does not exist. Available steps: {available or 'none'}.")
   with open(path, "rb") as f:
-    return pickle.load(f)
+    solver = pickle.load(f)
+  if solver.hullcover_state is not None:
+    solver.hullcover_state.bank.restore(directory)
+  return solver
 
 
 def save_config_once(config: RunConfig, directory: str):
