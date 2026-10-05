@@ -1,0 +1,55 @@
+# Leduc with HullCover portfolios. The game, seed and blueprint hyperparameters are those of
+# configs/leduc_sepot_mvs.yaml, so that the blueprint follows the same trajectory, and the
+# depth limit is at the public card as there. The value network learns the values of the pairs of
+# [blueprint + pool slots] during training, the portfolio of k mixtures over each pool is
+# selected at evaluation (eval.hullcover.k, 11 matches the 12 options of the SePoT run).
+game:
+  name: leduc
+  params: {}
+
+train:
+  steps: 30000
+  seed: 42
+  value_type: matrix_valued
+  # The RNaDConfig default, as in leduc_sepot_mvs.yaml.
+  entropy_schedule_size: [1000]
+  # The value network ratios are clipped at the default mvs_rho_vtrace (1.0); the SePoT run was
+  # trained without clipping (null).
+  portfolio_method: hullcover
+  hullcover:
+    every: 100
+    cap_c: 30
+    cap_x: 30
+    alphas: [0.25, 0.5, 0.75, 1.0]
+    partners: 4
+    tol: 1.0e-9
+    row_op: mix
+    evict_rule: outclassed
+    vertex_space: logit
+    vertex_window: step
+    eval_games: 512
+    min_component_weight: 1.0e-3
+  # All other RNaD hyperparameters are the defaults of RNaDConfig.
+
+checkpoint:
+  save: hullcover
+  save_every: 1000
+  print_every: 1000
+  eval_every: 1000
+  resume: false
+
+eval:
+  search:
+    depth_limit: null
+    leaf_after_chances: 2
+    resolve_iterations: 1000
+    resolve_every_step: false
+    prune_threshold: 1.0e-10
+  hullcover:
+    k: 11
+    milp_time_limit: 120.0
+    milp_gap: 0.01
+  tests:
+    blueprint_exploitability: {}
+    search_exploitability:
+      leaf_values: mvs

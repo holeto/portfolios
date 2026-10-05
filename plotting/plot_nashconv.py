@@ -1,13 +1,17 @@
 """Plots the NashConv of the blueprint and of the blueprint with resolving over training.
 
 Reads the evaluation results saved by
-  uv run python sepot.py --config CONFIG --mode eval --restore_step all
+  uv run python run.py --config CONFIG --mode eval --restore_step all
 (the `blueprint_exploitability` and `search_exploitability` tests) from the model
 directory given by the config, and saves the figure and a CSV table of the plotted
 values next to them (or to --output).
 
+HullCover runs are evaluated per portfolio size k (results `step_{N}_k{k}_{test}.json`), the
+plotted k is --k or the eval.hullcover.k of the config.
+
 Usage:
   uv run python plotting/plot_nashconv.py --config configs/leduc_sepot.yaml
+  uv run python plotting/plot_nashconv.py --config configs/leduc_hullcover.yaml --k 4
 """
 from __future__ import annotations
 
@@ -37,15 +41,15 @@ GRID = "#e4e3df"
 SURFACE = "#fcfcfb"
 
 
-def load_results(directory: str) -> dict:
-  """{test: {step: NashConv}} from the saved evaluation results."""
+def load_results(directory: str, k=None) -> dict:
+  """{test: {step: NashConv}} from the saved evaluation results (of portfolio size k for HullCover runs)."""
   results = {test: {} for test in SERIES}
   for path in glob.glob(os.path.join(directory, "eval", "step_*_*.json")):
-    match = re.fullmatch(r"step_(\d+)_(.+)\.json", os.path.basename(path))
-    if not match or match.group(2) not in SERIES:
+    match = re.fullmatch(r"step_(\d+)_(?:k(\d+)_)?(.+)\.json", os.path.basename(path))
+    if not match or match.group(3) not in SERIES or match.group(2) != (None if k is None else str(k)):
       continue
     with open(path) as f:
-      results[match.group(2)][int(match.group(1))] = json.load(f)["results"]["nash_conv"]
+      results[match.group(3)][int(match.group(1))] = json.load(f)["results"]["nash_conv"]
   return results
 
 
@@ -102,23 +106,29 @@ def main():
   parser.add_argument("--scale", type=float, default=None,
                       help="Multiplier of the NashConv (default: the game's max_bet_amount if it has one, e.g. "
                            "Leduc chips, else 1).")
+  parser.add_argument("--k", type=int, default=None,
+                      help="Portfolio size of a HullCover run (default: eval.hullcover.k of the config).")
   args = parser.parse_args()
 
   config = load_config(args.config)
+  hullcover = config.rnad.portfolio_method == "hullcover"
+  k = (args.k if args.k is not None else (config.eval.get("hullcover") or {}).get("k")) if hullcover else None
   directory = model_dir(config)
   game = config.game.make()
   max_bet = getattr(game, "max_bet_amount", None)
   scale = args.scale if args.scale is not None else float(max_bet or 1.0)
   unit = "chips" if args.scale is None and max_bet else ""
-  results = load_results(directory)
+  results = load_results(directory, k)
   if not any(results.values()):
-    raise FileNotFoundError(f"No evaluation results in {directory}eval/, run sepot.py --mode eval first.")
-  output = args.output or os.path.join(directory, "eval", "nashconv.pdf")
+    raise FileNotFoundError(f"No evaluation results in {directory}eval/, run run.py --mode eval first.")
+  output = args.output or os.path.join(directory, "eval", f"nashconv{f'_k{k}' if hullcover else ''}.pdf")
   search = config.eval.get("search", {})
   title = f"{game.to_compact_str()}: NashConv of the blueprint and with resolving during training"
   limit = (f"leaves after {search['leaf_after_chances']} chance events" if search.get("leaf_after_chances") is not None
            else f"depth limit {search.get('depth_limit')}")
-  subtitle = (f"K={config.rnad.num_transformations} transformations, {config.rnad.value_type} states, {limit}, "
+  portfolio = (f"HullCover k={k} from pools of {config.rnad.hullcover.cap_c}" if hullcover
+               else f"K={config.rnad.num_transformations} transformations")
+  subtitle = (f"{portfolio}, {config.rnad.value_type} states, {limit}, "
               f"{search.get('resolve_iterations')} CFR iterations per solve")
   plot(results, scale, unit, title, subtitle, output)
   table = os.path.splitext(output)[0] + ".csv"

@@ -9,10 +9,13 @@ non-conforming behavior with the user instead of documenting it here.
 ## Purpose
 
 Depth-limited solving of two-player zero-sum imperfect-information games with
-portfolios (SePoT). An RNaD blueprint is trained together with per-player policy
-transformations (the portfolio) and a value network over portfolio options. At test
-time, depth-limited CFR solves from the current public state with these values at the
-leaves, and resolves later public states behind a gadget.
+portfolios (SePoT). An RNaD blueprint is trained together with the portfolio of each
+player and a value network over portfolio options. The portfolio is built by
+`train.portfolio_method`: `gct` (per-player policy transformations fitted to the RNaD
+update directions) or `hullcover` (candidate pools maintained online from the RNaD
+stream, pruned by the eps-Dom-Mixed-MILP at evaluation). At test time, depth-limited CFR
+solves from the current public state with these values at the leaves, and resolves later
+public states behind a gadget.
 
 ## Setup and commands
 
@@ -22,19 +25,19 @@ root: models are saved relative to the working directory.
 
 ```
 uv sync
-uv run python sepot.py --config configs/<name>.yaml --mode train|eval|train_eval [--restore_step N|all] [--skip_existing] [--set eval.KEY=VALUE ...]
+uv run python run.py --config configs/<name>.yaml --mode train|eval|train_eval [--restore_step N|all] [--skip_existing] [--set eval.KEY=VALUE ...]
 uv run python evaluation/cfr_validation.py      # full-game CFR vs the Leduc reference equilibrium
 uv run python evaluation/dl_validation.py       # depth-limited CFR (+ resolving) with exact leaves vs the reference
 uv run python evaluation/gadget_validation.py   # gadget safety under an approximation error
 uv run python plotting/plot_nashconv.py --config configs/<name>.yaml
 ```
 
-`sepot.py` is the only script in the root. Further entry points belong to
+`run.py` is the only script in the root. Further entry points belong to
 `evaluation/`, `plotting/` or `debug/`.
 
 ## Layout
 
-- `sepot.py`: CLI entry point. Loads the YAML config and runs training and/or evaluation.
+- `run.py`: CLI entry point. Loads the YAML config and runs training and/or evaluation.
 - `configs/`: run configs (sections `game`, `train`, `checkpoint`, `eval`).
 - `games/`: JAX games implementing `JaxGame` (`jax_game.py`), registered in `games/__init__.py` (`make_game`).
   Goofspiel (fixed or random point cards), Leduc (full and first round only),
@@ -47,15 +50,19 @@ uv run python plotting/plot_nashconv.py --config configs/<name>.yaml
   - `exploitability.py`: best responses, NashConv, exact portfolio values, fixed-continuation leaves.
   - `normal_form_leaves.py`: exact matrix valued leaves with the whole continuation in
     normal form, and conversion of the leaf mixtures back to behavioral strategies.
+  - `hull_cover.py`: game-agnostic HullCover (one instance: candidates, tests, value matrix,
+    admission and merge rules) and the eps-Dom-Mixed-MILP (scipy HiGHS).
 - `train/`: neural network training.
   - `blueprint_and_mvs.py`: `RNaDSolver`, simultaneous-move RNaD (on-policy) with the
     transformation and value networks.
+  - `hullcover.py`: HullCover on the RNaD stream: strategy bank, Monte Carlo value matrices,
+    rounds, importance ratios of the pool members, selection and its leaf values.
   - `run_config.py`: config schema, `--set` overrides, model directories, checkpoints, config matching.
   - `trainer.py`: training loop with checkpointing and blueprint evaluation.
 - `gameplay/test_time_search.py`: `TestTimeSearch` (depth-limited solving and resolving
   for one player), baseline agents and `play_match`.
 - `evaluation/`: evaluation tests and validation scripts.
-  - `__init__.py`: registry of the tests run by `sepot.py` (`EVALUATIONS`).
+  - `__init__.py`: registry of the tests run by `run.py` (`EVALUATIONS`).
   - `runner.py`: resolves the `eval` config and runs the tests on checkpoints.
   - `blueprint_exploitability.py`, `search_exploitability.py`: registered tests.
   - `cfr_validation.py`, `dl_validation.py`, `gadget_validation.py`: standalone validations.
@@ -65,6 +72,8 @@ uv run python plotting/plot_nashconv.py --config configs/<name>.yaml
 - `debug/`: diagnostic scripts, run by path (not a package; `debug_utils.py` is imported as a sibling module).
   - `leaf_value_error.py`: resolving with learned vs exact leaf values of the same portfolio, and the error of the learned leaf values.
   - `leaf_option_selection.py`: bias and wrong option rate of the opponent's choice in multi valued leaves.
+  - `hullcover_diagnostics.py`: Monte Carlo vs exact value matrices and pool values, and vertex agreement
+    with the exact argmax of the regularised Q (HullCover runs).
 - `trained_networks_{mvs,mavs}/`, `plots/`: generated outputs.
 
 ## Conventions
@@ -93,6 +102,24 @@ uv run python plotting/plot_nashconv.py --config configs/<name>.yaml
   (`LEGACY_DEFAULTS` in `train/blueprint_and_mvs.py`).
 - Leaf value functions take `(states, state_tensors, game_legal)` and return `[H, Pl, K]`
   (multi valued) or `[H, K, K]` (matrix valued), optionally with legal options `[H, Pl, K]`.
+- HullCover (`portfolio_method: hullcover`):
+  - Two instances run on one RNaD stream: the P2 portfolio with P1 test strategies and the P1
+    portfolio with P2 test strategies. The value matrix of an instance is in the loss of the
+    covered player (the P1 value, negated for the P1 portfolio).
+  - Every `hullcover.every` learner steps a round offers `policy(theta_t)` and the vertex
+    `vertex(theta_s, theta_t)` (per infoset the argmax of the logit, or policy, change over the
+    last learner step, s = t - 1, or with `vertex_window: round` since the previous round) to the
+    candidates, then the vertex to the tests. Base strategies are actor snapshots shared by both
+    players.
+  - Pool and test members are realization-plan mixtures of base strategies (weights over bases).
+    The value matrices are Monte Carlo estimates of base pairs under one fixed key for the whole run,
+    combined bilinearly.
+  - The value network outputs the pairs of [blueprint + `cap_c` pool slots] (matrix: index
+    `i * (cap_c + 1) + j`, multi: [both blueprints, P2 slots, P1 slots]), with the importance ratio
+    of a slot from its mixture conditioned on the player's own past actions.
+  - At evaluation the MILP selects `eval.hullcover.k` mixtures `lam` over each pool, and the leaf
+    values are the `lam`-linear combinations of the pool values (the pool member drawn at the leaf).
+    Options are [blueprint, k mixtures].
 - Resolving uses the gadget of the opponent: the resolving player's and chance reaches
   come from the previous average strategy, the opponent may terminate with its
   counterfactual values from the previous solve.
@@ -114,6 +141,9 @@ uv run python plotting/plot_nashconv.py --config configs/<name>.yaml
 - Evaluation and resuming fail if the game or the training hyperparameters (all of
   `train` except `steps`) differ from the saved `config.yaml`. Only `eval.*` may be
   overridden with `--set`; eval fields left at their defaults are reported as a warning.
+- HullCover runs set `train.portfolio_method: hullcover` with a `train.hullcover` section, and
+  `eval.hullcover.k` (with the MILP settings). The selection is cached in `<model dir>/hullcover/step_{N}_k{k}.pkl`,
+  evaluation results are saved per k as `eval/step_{N}_k{k}_{test}.json`.
 - Adding an evaluation test: a module in `evaluation/` with a `Config` dataclass and
   `run(solver, game, search_config, test_config, cache) -> dict`, registered in `evaluation/__init__.py`.
 - Adding a top-level package: list it under `[tool.hatch.build.targets.wheel]` in `pyproject.toml` and run `uv sync`.

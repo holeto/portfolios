@@ -2,13 +2,17 @@
 
 The policy learning is the simultaneous move variant of R-NaD
 (https://arxiv.org/pdf/2510.05048, ported from `sim_rnad.py`) trained
-on-policy on batched rollouts of a JAX game. On top of it:
-  - Transformations: for each player, a network producing K policy
+on-policy on batched rollouts of a JAX game. On top of it, the portfolio of each
+player is built by one of the methods (`portfolio_method`):
+  - "gct", transformations: for each player, a network producing K policy
     deviation directions, fitted to the directions of the R-NaD policy updates.
     The portfolio of a player is the policy itself and its K transformations.
+  - "hullcover": candidate pools maintained online from the R-NaD stream
+    (`train/hullcover.py`), the portfolio is selected from them at evaluation.
   - Matrix valued states (MVS): a network on the state tensor estimating
     the P1 value of each pair of portfolio policies, (K + 1)^2 outputs with
-    index i * (K + 1) + j for P1 portfolio policy i and P2 portfolio policy j.
+    index i * (K + 1) + j for P1 portfolio policy i and P2 portfolio policy j
+    (for hullcover the pairs of [blueprint + pool slots], K = cap_c).
 These are used as the blueprint and the depth-limit leaf values in resolving.
 """
 from __future__ import annotations
@@ -26,7 +30,10 @@ import optax
 from jax import lax
 
 from games import make_game
+from iig_algorithms.exploitability import make_exact_leaf_values
+from iig_algorithms.hull_cover import HullCoverConfig
 from iig_algorithms.tree_builder import MATRIX_VALUED, MULTI_VALUED, VALUE_TYPES, LeafValues
+from train import hullcover
 
 Params = chex.ArrayTree
 
@@ -331,7 +338,11 @@ class AdamConfig:
 
 # Hyperparameters added after models were saved, with the values those models were trained with
 # (their pickled configs and saved config.yaml files do not contain them).
-LEGACY_DEFAULTS = {"mvs_rho_vtrace": None}
+LEGACY_DEFAULTS = {"mvs_rho_vtrace": None, "portfolio_method": "gct", "hullcover": None}
+
+GCT = "gct"
+HULLCOVER = "hullcover"
+PORTFOLIO_METHODS = (GCT, HULLCOVER)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -372,6 +383,9 @@ class RNaDConfig:
   # i * (K + 1) + j for P1 option i and P2 option j.
   value_type: str = MULTI_VALUED
   seed: int = 42
+  # "gct" (the transformations) or "hullcover" (the `hullcover` section is then required).
+  portfolio_method: str = GCT
+  hullcover: Optional[HullCoverConfig] = None
 
 
 @chex.dataclass(frozen=True)
@@ -421,7 +435,8 @@ class RNaDSolver:
     self.game = make_game(self.game_name, **self.game_params)
     self.num_actions = self.game.num_distinct_actions()
     self.num_players = self.game.num_players()
-    self.num_portfolio = config.num_transformations + 1
+    # The HullCover portfolio size is known once its selection is attached.
+    self.num_portfolio = None if config.portfolio_method == HULLCOVER else config.num_transformations + 1
     # The terminal node is not trained on.
     self.trajectory_max = self.game.max_trajectory_length_no_chance() - 1
 
@@ -429,8 +444,17 @@ class RNaDSolver:
     self.critic = CriticNetwork(config.critic_network_layers)
     if config.value_type not in VALUE_TYPES:
       raise ValueError(f"Unknown value type {config.value_type}, expected one of {VALUE_TYPES}.")
-    num_values = (self.num_portfolio ** 2 if config.value_type == MATRIX_VALUED
-                  else 1 + 2 * config.num_transformations)
+    if config.portfolio_method not in PORTFOLIO_METHODS:
+      raise ValueError(f"Unknown portfolio method {config.portfolio_method}, expected one of {PORTFOLIO_METHODS}.")
+    if (config.portfolio_method == HULLCOVER) != (config.hullcover is not None):
+      raise ValueError("The hullcover section is required by, and only allowed with, portfolio_method hullcover.")
+    self.hullcover_state: Optional[hullcover.HullCoverState] = None
+    self.selection: Optional[hullcover.Selection] = None
+    self._pool = None
+    self._vertex_reference = None
+    # Options of the value network outputs: the portfolio, or [blueprint + pool slots] for hullcover.
+    num_options = config.hullcover.cap_c + 1 if self.is_hullcover else self.num_portfolio
+    num_values = (num_options ** 2 if config.value_type == MATRIX_VALUED else 1 + 2 * (num_options - 1))
     self.mvs_network = MultiValuedStatesNetwork(num_values, config.mvs_network_layers)
     self.transformation_network = TransformationsNetwork(self.num_actions, config.num_transformations,
                                                          config.transformation_network_layers)
@@ -464,6 +488,10 @@ class RNaDSolver:
   def learner_steps(self) -> int:
     return int(self.state.learner_step)
 
+  @property
+  def is_hullcover(self) -> bool:
+    return self.config.portfolio_method == HULLCOVER
+
   # ----------------------------------------------------------------------------
   # Trajectory collection
   # ----------------------------------------------------------------------------
@@ -482,7 +510,13 @@ class RNaDSolver:
     return states, legal
 
   def _rollout(self, actor_params: Params, key: chex.PRNGKey) -> TimeStep:
-    game, batch = self.game, self.config.batch_size
+    return self.rollout_with_policy(lambda obs, legal: self.actor.apply(actor_params, obs, legal)[0], key,
+                                    self.config.batch_size)
+
+  def rollout_with_policy(self, policy_fn, key: chex.PRNGKey, batch: int) -> TimeStep:
+    """Batched trajectories from the initial state, both players acting by
+    policy_fn(obs [B, Pl, I], legal [B, Pl, A]) -> policies [B, Pl, A]."""
+    game = self.game
     init_state, init_legal = game.initialize_structures()
     states = jax.tree.map(lambda x: jnp.broadcast_to(jnp.asarray(x), (batch,) + jnp.shape(x)), init_state)
     legal = jnp.broadcast_to(jnp.asarray(init_legal, dtype=jnp.float32), (batch,) + jnp.shape(init_legal))
@@ -497,7 +531,7 @@ class RNaDSolver:
       obs = jnp.stack([p1_iset, p2_iset], axis=1).astype(jnp.float32)
       # Guard against terminal states without legal actions.
       legal = jnp.where(jnp.sum(legal, -1, keepdims=True) > 0, legal, jax.nn.one_hot(0, self.num_actions))
-      pi, _, _ = self.actor.apply(actor_params, obs, legal)
+      pi = policy_fn(obs, legal)
       actions = jax.random.categorical(action_key, jnp.log(pi), axis=-1).astype(jnp.int32)
       new_states, terminal, reward, new_legal = jax.vmap(game.apply_action)(states, actions)
       new_states, new_legal = self._play_chance(new_states, new_legal.astype(jnp.float32), chance_key)
@@ -563,10 +597,14 @@ class RNaDSolver:
     loss = (direction - lax.stop_gradient(update)) ** 2
     return masked_mean(loss, train_mask)
 
-  def mvs_loss(self, mvs_params, mvs_target, actor_params, transformation_params, ts: TimeStep):
+  def mvs_loss(self, mvs_params, mvs_target, actor_params, transformation_params, ts: TimeStep, pool=None):
     pi, _, _ = self.actor.apply(actor_params, ts.obs, ts.legal)
     ratios = []
     for player in range(self.num_players):
+      if self.is_hullcover:
+        # The blueprint and the realization-plan mixtures of the pool slots.
+        ratios.append(hullcover.pool_ratios(self.actor, self.config.hullcover.vertex_space, pool, pi, ts, player))
+        continue
       legal = ts.legal[:, :, player]
       directions = self.transformation_network.apply(transformation_params[player], ts.obs[:, :, player])
       directions = normalize_direction_with_mask(directions, legal)
@@ -590,14 +628,18 @@ class RNaDSolver:
     rho = self.config.rho_vtrace if self.config.mvs_rho_vtrace is None else self.config.mvs_rho_vtrace
     target = mvs_v_trace(mvs_v_target, ts.valid > 0, joint_ratio, ts.reward,
                          self.config.lambda_vtrace, self.config.c_vtrace, rho, self.config.gamma)
-    return masked_mean((mvs_v - lax.stop_gradient(target)) ** 2, ts.valid[..., None])
+    squared_error = (mvs_v - lax.stop_gradient(target)) ** 2
+    if self.is_hullcover:
+      # Outputs of empty pool slots are not trained (summed over the outputs, as without the mask).
+      squared_error = squared_error * hullcover.pool_output_mask(pool, self.config.value_type)
+    return masked_mean(squared_error, ts.valid[..., None])
 
   # ----------------------------------------------------------------------------
   # Learner step
   # ----------------------------------------------------------------------------
 
   @functools.partial(jax.jit, static_argnums=(0,))
-  def _learner_step(self, state: TrainState):
+  def _learner_step(self, state: TrainState, pool=None):
     config = self.config
     key, rollout_key = jax.random.split(state.key)
     ts = self._rollout(state.params["actor"], rollout_key)
@@ -616,17 +658,19 @@ class RNaDSolver:
         lambda: (state.prev_actor, state.prev_actor_))
     policy_after, _, _ = self.actor.apply(params["actor"], ts.obs, ts.legal)
 
-    transformation_params, transformation_opt_state = [], []
-    for player in range(self.num_players):
-      t_loss, t_grad = jax.value_and_grad(self.transformation_loss)(
-          state.transformation_params[player], policy_before, policy_after, player, ts)
-      t_updates, t_opt = self.optimizer.update(t_grad, state.transformation_opt_state[player])
-      transformation_params.append(optax.apply_updates(state.transformation_params[player], t_updates))
-      transformation_opt_state.append(t_opt)
-      logs[f"transformation_loss_p{player}"] = t_loss
+    transformation_params, transformation_opt_state = state.transformation_params, state.transformation_opt_state
+    if not self.is_hullcover:
+      transformation_params, transformation_opt_state = [], []
+      for player in range(self.num_players):
+        t_loss, t_grad = jax.value_and_grad(self.transformation_loss)(
+            state.transformation_params[player], policy_before, policy_after, player, ts)
+        t_updates, t_opt = self.optimizer.update(t_grad, state.transformation_opt_state[player])
+        transformation_params.append(optax.apply_updates(state.transformation_params[player], t_updates))
+        transformation_opt_state.append(t_opt)
+        logs[f"transformation_loss_p{player}"] = t_loss
 
     mvs_loss, mvs_grad = jax.value_and_grad(self.mvs_loss)(
-        state.mvs_params, state.mvs_target, params["actor"], transformation_params, ts)
+        state.mvs_params, state.mvs_target, params["actor"], transformation_params, ts, pool)
     mvs_updates, mvs_opt_state = self.optimizer.update(mvs_grad, state.mvs_opt_state)
     mvs_params = optax.apply_updates(state.mvs_params, mvs_updates)
     mvs_target = optax.incremental_update(mvs_params, state.mvs_target, config.target_network_avg)
@@ -643,10 +687,44 @@ class RNaDSolver:
 
   def step(self) -> dict:
     """One on-policy learner step: collect a batch and update all networks."""
-    self.state, logs = self._learner_step(self.state)
+    if self.is_hullcover:
+      if self._pool is None:
+        self._pool = self._pool_arrays()
+      state = self.hullcover_state
+      if (state is not None and self.config.hullcover.vertex_window == "step"
+          and self.learner_steps + 1 == state.next_round_step()):
+        # The step vertex of the next round is the change over this learner step.
+        self._vertex_reference = jax.device_get(self.state.params["actor"])
+      self.state, logs = self._learner_step(self.state, self._pool)
+    else:
+      self.state, logs = self._learner_step(self.state)
     logs = {k: float(v) for k, v in logs.items()}
     logs["learner_steps"] = self.learner_steps
     return logs
+
+  # ----------------------------------------------------------------------------
+  # HullCover
+  # ----------------------------------------------------------------------------
+
+  def _pool_arrays(self) -> dict:
+    if self.hullcover_state is None:
+      return hullcover.pool_arrays(hullcover.StrategyBank(), [[], []], self.config.hullcover.cap_c,
+                                   self.state.params["actor"])
+    return self.hullcover_state.pool_arrays(self.state.params["actor"])
+
+  def hullcover_round(self):
+    """A round of HullCover at the current learner step (the first one, at step 0, only stores the
+    initial policy). Rounds are due at `hullcover_state.next_round_step()`."""
+    if self.hullcover_state is None:
+      self.hullcover_state = hullcover.HullCoverState(self.config.hullcover, self.config.seed)
+    self.hullcover_state.run_round(self, self._vertex_reference)
+    self._vertex_reference = None
+    self._pool = self._pool_arrays()
+
+  def attach_selection(self, selection: "hullcover.Selection"):
+    """The HullCover portfolio (k mixtures over each pool) used by the leaf values."""
+    self.selection = selection
+    self.num_portfolio = selection.k + 1
 
   # ----------------------------------------------------------------------------
   # Inference API
@@ -673,6 +751,8 @@ class RNaDSolver:
     matrix valued [H, K + 1, K + 1] with the P1 option in rows."""
     state_tensors = jnp.asarray(state_tensors, dtype=jnp.float32)
     values = np.asarray(self._jit_mvs(self.state.mvs_target, state_tensors))
+    if self.is_hullcover:
+      return hullcover.combine(values, self._require_selection(), self.config.value_type)
     num_states, k = state_tensors.shape[0], self.config.num_transformations
     if self.config.value_type == MATRIX_VALUED:
       return values.reshape(num_states, self.num_portfolio, self.num_portfolio)
@@ -682,8 +762,23 @@ class RNaDSolver:
 
   def leaf_values(self) -> LeafValues:
     """Depth-limit leaf values for `tree_builder.build_tree`."""
+    if self.is_hullcover:
+      self._require_selection()
     return LeafValues(fn=lambda states, state_tensors, legal: self.state_values(state_tensors),
                       value_type=self.config.value_type, num_options=self.num_portfolio)
+
+  def exact_leaf_values(self) -> LeafValues:
+    """Leaf values of the portfolio evaluated exactly in the rest of the game below each leaf
+    (only for short follow-ups)."""
+    if self.is_hullcover:
+      return hullcover.ExactPool(self).leaf_values(self._require_selection(), self.config.value_type)
+    return make_exact_leaf_values(self.game, self.portfolio_policies, self.num_portfolio, self.config.value_type)
+
+  def _require_selection(self) -> "hullcover.Selection":
+    if self.selection is None:
+      raise ValueError("The HullCover portfolio is selected at evaluation, attach it with attach_selection "
+                       "(evaluation.runner.load_for_eval).")
+    return self.selection
 
   @functools.partial(jax.jit, static_argnums=(0,))
   def _jit_portfolio(self, actor_params, transformation_params, obs, legal, player):
@@ -695,13 +790,15 @@ class RNaDSolver:
 
   def portfolio_policies(self, player: int, obs: np.ndarray, legal: np.ndarray) -> np.ndarray:
     """The portfolio policies [..., A, K + 1] of a player, the first one being the blueprint."""
+    if self.is_hullcover:
+      raise ValueError("HullCover portfolio members draw a pool member at the leaf, use exact_leaf_values.")
     return np.asarray(self._jit_portfolio(self.state.params["actor"], self.state.transformation_params[player],
                                           jnp.asarray(obs, dtype=jnp.float32), jnp.asarray(legal, dtype=jnp.float32),
                                           player))
 
   def __getstate__(self):
     return {"config": self.config, "game_name": self.game_name, "game_params": self.game_params,
-            "state": jax.device_get(self.state)}
+            "state": jax.device_get(self.state), "hullcover_state": self.hullcover_state}
 
   def __setstate__(self, state):
     config = state["config"]
@@ -711,6 +808,7 @@ class RNaDSolver:
     self.game_params = state["game_params"]
     self.init()
     self.state = jax.tree.map(jnp.asarray, state["state"])
+    self.hullcover_state = state.get("hullcover_state")
 
 
 def masked_mean_over_time(x: chex.Array, mask: chex.Array) -> chex.Array:
