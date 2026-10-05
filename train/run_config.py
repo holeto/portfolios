@@ -21,6 +21,7 @@ import yaml
 
 from games import make_game
 from games.jax_game import JaxGame
+from iig_algorithms.hull_cover import HullCoverConfig
 from iig_algorithms.tree_builder import MATRIX_VALUED, MULTI_VALUED
 from train.blueprint_and_mvs import LEGACY_DEFAULTS, AdamConfig, RNaDConfig, RNaDSolver
 
@@ -108,6 +109,8 @@ def parse_rnad_config(train_section: dict) -> RNaDConfig:
   values.pop("steps", None)
   if "adam" in values:
     values["adam"] = _from_dict(AdamConfig, values["adam"], "train.adam")
+  if values.get("hullcover") is not None:
+    values["hullcover"] = _from_dict(HullCoverConfig, values["hullcover"], "train.hullcover")
   return _from_dict(RNaDConfig, values, "train")
 
 
@@ -247,9 +250,10 @@ def load_saved_config(directory: str) -> RunConfig:
 
 
 # Hyperparameters a fork has to share with its run: they define the shapes of the
-# networks, or (the seed) locate the run.
+# networks, or (the seed) locate the run, or (the portfolio method) the state continued by the fork.
 FORK_FIXED_FIELDS = ("actor_network_layers", "critic_network_layers", "mvs_network_layers",
-                     "transformation_network_layers", "num_transformations", "value_type", "seed")
+                     "transformation_network_layers", "num_transformations", "value_type", "seed",
+                     "portfolio_method", "hullcover")
 
 
 def config_differences(config: RunConfig, directory: str) -> list[tuple[str, Any, Any]]:

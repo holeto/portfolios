@@ -1,6 +1,8 @@
-"""Training of the blueprint, transformations and matrix valued states with checkpointing."""
+"""Training of the blueprint, portfolios (transformations or HullCover pools) and matrix valued
+states with checkpointing."""
 from __future__ import annotations
 
+import resource
 import time
 
 import jax
@@ -10,6 +12,18 @@ from evaluation import blueprint_exploitability
 from train.blueprint_and_mvs import RNaDSolver
 from train.run_config import (RunConfig, check_fork_compatible, check_matches_saved, list_checkpoints,
                               load_checkpoint, model_dir, parent_model_dir, save_checkpoint, save_config_once)
+
+
+def _peak_memory() -> str:
+  """Peak resident memory of the process and, on accelerators, the peak memory in use on each
+  device (not the memory preallocated by JAX), in GiB."""
+  # ru_maxrss is in KiB on Linux.
+  usage = [f"peak_rss_gib: {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20:.3g}"]
+  for device in jax.local_devices():
+    stats = device.memory_stats()  # None on CPU.
+    if stats and "peak_bytes_in_use" in stats:
+      usage.append(f"peak_{device.platform}{device.id}_gib: {stats['peak_bytes_in_use'] / 2**30:.3g}")
+  return ", ".join(usage)
 
 
 def _fork(config: RunConfig, directory: str, fork_from: int) -> RNaDSolver:
@@ -24,6 +38,7 @@ def _fork(config: RunConfig, directory: str, fork_from: int) -> RNaDSolver:
   if jax.tree.structure(expected) != jax.tree.structure(loaded) or jax.tree.leaves(expected) != jax.tree.leaves(loaded):
     raise ValueError(f"The checkpoint {fork_from} of {parent} does not fit the networks of the fork.")
   solver.state = parent_solver.state
+  solver.hullcover_state = parent_solver.hullcover_state
   save_config_once(config, directory)
   save_checkpoint(solver, directory)
   print(f"Forking {parent} at step {fork_from} into {directory}", flush=True)
@@ -69,6 +84,11 @@ def train(config: RunConfig) -> RNaDSolver:
     print(f"The model already has {solver.learner_steps} >= {config.steps} learner steps.", flush=True)
     return solver
 
+  if solver.is_hullcover and solver.hullcover_state is None:
+    if solver.learner_steps > 0:
+      raise ValueError(f"The checkpoint at step {solver.learner_steps} has no HullCover state.")
+    solver.hullcover_round()  # The snapshot of the initial policy.
+
   cache = {}
 
   def evaluate_blueprint():
@@ -84,12 +104,18 @@ def train(config: RunConfig) -> RNaDSolver:
   while solver.learner_steps < config.steps:
     logs = solver.step()
     step = solver.learner_steps
+    if solver.is_hullcover and step == solver.hullcover_state.next_round_step():
+      solver.hullcover_round()
     if checkpoint.print_every > 0 and step % checkpoint.print_every == 0:
-      print(f"[{time.time() - start:7.1f}s] " + ", ".join(f"{k}: {v:.4g}" for k, v in logs.items()), flush=True)
+      print(f"[{time.time() - start:7.1f}s] " + ", ".join(f"{k}: {v:.4g}" for k, v in logs.items())
+            + f", {_peak_memory()}", flush=True)
+      if solver.is_hullcover:
+        print(f"  {solver.hullcover_state.summary()}", flush=True)
     if checkpoint.eval_every > 0 and step % checkpoint.eval_every == 0:
       evaluate_blueprint()
     if checkpoint.save_every > 0 and step % checkpoint.save_every == 0:
       save_checkpoint(solver, directory)
   path = save_checkpoint(solver, directory)
   print(f"Saved {path}", flush=True)
+  print(f"Peak memory: {_peak_memory()}", flush=True)
   return solver

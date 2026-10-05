@@ -1,5 +1,6 @@
-"""SePoT entrypoint: training of the blueprint with portfolios and matrix valued
-states, and evaluation of the depth-limited test-time search.
+"""Entrypoint: training of the blueprint with portfolios (SePoT/GCT or HullCover, by
+train.portfolio_method) and matrix valued states, and evaluation of the depth-limited
+test-time search.
 
 Modes:
   train       Trains a new model, or continues training (checkpoint.resume).
@@ -8,10 +9,11 @@ Modes:
   train_eval  Trains and then evaluates the final checkpoint.
 
 Examples:
-  uv run python sepot.py --config configs/goofspiel4.yaml --mode train
-  uv run python sepot.py --config configs/goofspiel4.yaml --mode eval --restore_step 5000 \\
+  uv run python run.py --config configs/goofspiel4.yaml --mode train
+  uv run python run.py --config configs/goofspiel4.yaml --mode eval --restore_step 5000 \\
       --set eval.search.depth_limit=2 --set eval.tests.search_exploitability.leaf_values=exact
-  uv run python sepot.py --config configs/leduc_sepot.yaml --mode eval --restore_step all --skip_existing
+  uv run python run.py --config configs/leduc_sepot.yaml --mode eval --restore_step all --skip_existing
+  uv run python run.py --config configs/leduc_hullcover.yaml --mode eval --set eval.hullcover.k=4
 """
 import argparse
 

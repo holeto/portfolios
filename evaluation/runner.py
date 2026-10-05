@@ -10,6 +10,8 @@ import numpy as np
 
 from evaluation import DEFAULT_TESTS, EVALUATIONS
 from gameplay.test_time_search import TestTimeSearchConfig
+from train.blueprint_and_mvs import HULLCOVER, RNaDSolver
+from train.hullcover import SelectionConfig, load_or_select
 from train.run_config import RunConfig, check_matches_saved, list_checkpoints, load_checkpoint, model_dir
 
 # Set per player by the tests, not configurable.
@@ -21,6 +23,7 @@ class ResolvedEval:
   search: TestTimeSearchConfig
   tests: list  # of (name, module, test config)
   defaulted: list  # of (field path, default value)
+  hullcover: Optional[SelectionConfig] = None  # the portfolio selection of HullCover runs
 
 
 def _build(cls, values: Optional[dict], section: str, excluded=()):
@@ -35,12 +38,20 @@ def _build(cls, values: Optional[dict], section: str, excluded=()):
   return config, defaulted
 
 
-def resolve_eval_config(eval_raw: dict) -> ResolvedEval:
+def resolve_eval_config(eval_raw: dict, portfolio_method: str = "gct") -> ResolvedEval:
   """Dataclass defaults overridden by the eval part of the config (YAML and --set)."""
-  unknown = set(eval_raw) - {"search", "tests"}
+  unknown = set(eval_raw) - {"search", "tests", "hullcover"}
   if unknown:
-    raise ValueError(f"Unknown fields {sorted(unknown)} in 'eval', expected 'search' and 'tests'.")
+    raise ValueError(f"Unknown fields {sorted(unknown)} in 'eval', expected 'search', 'tests' and 'hullcover'.")
   search, defaulted = _build(TestTimeSearchConfig, eval_raw.get("search"), "eval.search", _SEARCH_INTERNAL_FIELDS)
+  selection = None
+  if portfolio_method == HULLCOVER:
+    selection, selection_defaulted = _build(SelectionConfig, eval_raw.get("hullcover"), "eval.hullcover")
+    if selection.k is None:
+      raise ValueError("HullCover runs need the portfolio size eval.hullcover.k.")
+    defaulted.extend(selection_defaulted)
+  elif eval_raw.get("hullcover") is not None:
+    raise ValueError("eval.hullcover is only used with train.portfolio_method hullcover.")
   tests_raw = eval_raw.get("tests")
   if tests_raw is None:
     tests_raw = DEFAULT_TESTS
@@ -53,7 +64,7 @@ def resolve_eval_config(eval_raw: dict) -> ResolvedEval:
     test_config, test_defaulted = _build(module.Config, params, f"eval.tests.{name}")
     tests.append((name, module, test_config))
     defaulted.extend(test_defaulted)
-  return ResolvedEval(search=search, tests=tests, defaulted=defaulted)
+  return ResolvedEval(search=search, tests=tests, defaulted=defaulted, hullcover=selection)
 
 
 def _report_eval_config(eval_raw: dict, resolved: ResolvedEval):
@@ -66,6 +77,8 @@ def _report_eval_config(eval_raw: dict, resolved: ResolvedEval):
   search = {f.name: getattr(resolved.search, f.name) for f in dataclasses.fields(resolved.search)
             if f.name not in _SEARCH_INTERNAL_FIELDS}
   print(f"Eval search config: {search}")
+  if resolved.hullcover is not None:
+    print(f"Eval HullCover selection: {dataclasses.asdict(resolved.hullcover)}")
   for name, _, test_config in resolved.tests:
     print(f"Eval test {name}: {dataclasses.asdict(test_config)}")
 
@@ -80,8 +93,19 @@ def _jsonable(value):
   return value
 
 
-def _result_path(directory: str, step: int, name: str) -> str:
+def _result_path(directory: str, step: int, name: str, resolved: ResolvedEval) -> str:
+  # HullCover runs are evaluated per portfolio size k.
+  if resolved.hullcover is not None:
+    name = f"k{resolved.hullcover.k}_{name}"
   return os.path.join(directory, "eval", f"step_{step}_{name}.json")
+
+
+def load_for_eval(directory: str, step: int, resolved: ResolvedEval) -> RNaDSolver:
+  """The checkpoint, with the HullCover portfolio selected (and cached) for HullCover runs."""
+  solver = load_checkpoint(directory, step)
+  if solver.is_hullcover:
+    solver.attach_selection(load_or_select(solver, directory, step, resolved.hullcover))
+  return solver
 
 
 def run_evaluation(config: RunConfig, restore_step: Union[None, int, str] = None, skip_existing: bool = False) -> dict:
@@ -101,7 +125,7 @@ def run_evaluation(config: RunConfig, restore_step: Union[None, int, str] = None
   else:
     steps = [int(restore_step)]
 
-  resolved = resolve_eval_config(config.eval)
+  resolved = resolve_eval_config(config.eval, config.rnad.portfolio_method)
   _report_eval_config(config.eval, resolved)
   search = {f.name: getattr(resolved.search, f.name) for f in dataclasses.fields(resolved.search)
             if f.name not in _SEARCH_INTERNAL_FIELDS}
@@ -111,11 +135,11 @@ def run_evaluation(config: RunConfig, restore_step: Union[None, int, str] = None
   os.makedirs(os.path.join(directory, "eval"), exist_ok=True)
   for step in steps:
     tests = [(name, module, test_config) for name, module, test_config in resolved.tests
-             if not (skip_existing and os.path.exists(_result_path(directory, step, name)))]
+             if not (skip_existing and os.path.exists(_result_path(directory, step, name, resolved)))]
     if not tests:
       print(f"Skipping step {step}, all the results exist.", flush=True)
       continue
-    solver = load_checkpoint(directory, step)
+    solver = load_for_eval(directory, step, resolved)
     print(f"Evaluating {directory} at step {step}", flush=True)
     results = {}
     for name, module, test_config in tests:
@@ -123,8 +147,11 @@ def run_evaluation(config: RunConfig, restore_step: Union[None, int, str] = None
       result = _jsonable(module.run(solver, solver.game, resolved.search, test_config, cache))
       results[name] = result
       print(f"{name}: {result}", flush=True)
-      with open(_result_path(directory, step, name), "w") as f:
-        json.dump({"step": step, "test": name, "test_config": dataclasses.asdict(test_config),
-                   "search_config": search, "results": result}, f, indent=2)
+      with open(_result_path(directory, step, name, resolved), "w") as f:
+        record = {"step": step, "test": name, "test_config": dataclasses.asdict(test_config),
+                  "search_config": search, "results": result}
+        if resolved.hullcover is not None:
+          record["hullcover"] = dataclasses.asdict(resolved.hullcover)
+        json.dump(record, f, indent=2)
     all_results[step] = results
   return all_results
