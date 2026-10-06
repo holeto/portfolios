@@ -421,6 +421,30 @@ def _canonicalize(tree: chex.ArrayTree) -> chex.ArrayTree:
   return jax.tree.map(lambda x: jnp.array(x, dtype=jnp.asarray(x).dtype), tree)
 
 
+# Inference functions with the networks as static arguments: networks are equal by their fields, so
+# the solvers of all the checkpoints of a run share the compilations, and the cache of jit does not
+# keep the solvers alive.
+
+@functools.partial(jax.jit, static_argnums=(0,))
+def _apply_policy(actor: ActorNetwork, actor_params, obs, legal):
+  return actor.apply(actor_params, obs, legal)[0]
+
+
+@functools.partial(jax.jit, static_argnums=(0,))
+def _apply_mvs(mvs_network: MultiValuedStatesNetwork, mvs_params, states):
+  return mvs_network.apply(mvs_params, states)
+
+
+@functools.partial(jax.jit, static_argnums=(0, 1))
+def _apply_portfolio(actor: ActorNetwork, transformation_network: TransformationsNetwork, actor_params,
+                     transformation_params, obs, legal):
+  pi, _, _ = actor.apply(actor_params, obs, legal)
+  directions = transformation_network.apply(transformation_params, obs)
+  directions = normalize_direction_with_mask(directions, legal)
+  directions = jnp.concatenate([jnp.zeros_like(directions[..., :1]), directions], axis=-1)
+  return transform_policies(pi, directions, legal)
+
+
 class RNaDSolver:
   """Simultaneous move R-NaD with portfolio transformations and MVS."""
 
@@ -730,19 +754,11 @@ class RNaDSolver:
   # Inference API
   # ----------------------------------------------------------------------------
 
-  @functools.partial(jax.jit, static_argnums=(0,))
-  def _jit_policy(self, actor_params, obs, legal):
-    return self.actor.apply(actor_params, obs, legal)[0]
-
   def policy(self, obs: np.ndarray, legal: np.ndarray) -> np.ndarray:
     """Blueprint policy [..., A] for infoset tensors [..., I] and legal actions [..., A]."""
     obs = jnp.asarray(obs, dtype=jnp.float32)
     legal = jnp.asarray(legal, dtype=jnp.float32)
-    return np.asarray(self._jit_policy(self.state.params["actor"], obs, legal))
-
-  @functools.partial(jax.jit, static_argnums=(0,))
-  def _jit_mvs(self, mvs_params, states):
-    return self.mvs_network.apply(mvs_params, states)
+    return np.asarray(_apply_policy(self.actor, self.state.params["actor"], obs, legal))
 
   def state_values(self, state_tensors: np.ndarray) -> np.ndarray:
     """P1 values of the portfolio policies in the given states:
@@ -750,7 +766,7 @@ class RNaDSolver:
     the opponent on its option f (0 being the blueprint), or
     matrix valued [H, K + 1, K + 1] with the P1 option in rows."""
     state_tensors = jnp.asarray(state_tensors, dtype=jnp.float32)
-    values = np.asarray(self._jit_mvs(self.state.mvs_target, state_tensors))
+    values = np.asarray(_apply_mvs(self.mvs_network, self.state.mvs_target, state_tensors))
     if self.is_hullcover:
       return hullcover.combine(values, self._require_selection(), self.config.value_type)
     num_states, k = state_tensors.shape[0], self.config.num_transformations
@@ -780,21 +796,13 @@ class RNaDSolver:
                        "(evaluation.runner.load_for_eval).")
     return self.selection
 
-  @functools.partial(jax.jit, static_argnums=(0,))
-  def _jit_portfolio(self, actor_params, transformation_params, obs, legal, player):
-    pi, _, _ = self.actor.apply(actor_params, obs, legal)
-    directions = self.transformation_network.apply(transformation_params, obs)
-    directions = normalize_direction_with_mask(directions, legal)
-    directions = jnp.concatenate([jnp.zeros_like(directions[..., :1]), directions], axis=-1)
-    return transform_policies(pi, directions, legal)
-
   def portfolio_policies(self, player: int, obs: np.ndarray, legal: np.ndarray) -> np.ndarray:
     """The portfolio policies [..., A, K + 1] of a player, the first one being the blueprint."""
     if self.is_hullcover:
       raise ValueError("HullCover portfolio members draw a pool member at the leaf, use exact_leaf_values.")
-    return np.asarray(self._jit_portfolio(self.state.params["actor"], self.state.transformation_params[player],
-                                          jnp.asarray(obs, dtype=jnp.float32), jnp.asarray(legal, dtype=jnp.float32),
-                                          player))
+    return np.asarray(_apply_portfolio(self.actor, self.transformation_network, self.state.params["actor"],
+                                       self.state.transformation_params[player], jnp.asarray(obs, dtype=jnp.float32),
+                                       jnp.asarray(legal, dtype=jnp.float32)))
 
   def __getstate__(self):
     return {"config": self.config, "game_name": self.game_name, "game_params": self.game_params,

@@ -4,8 +4,13 @@ from games.jax_leduc import JaxLeduc, JaxLeducRound1
 from games.jax_rps import JaxRPS, JaxStochasticRPS, JaxTurnBasedRPS
 
 
+# Games are immutable, so one instance per name and parameters is shared: the functions jitted on a
+# game (e.g. `tree_builder.game_functions`) are then compiled once for all the solvers using it.
+_GAMES: dict[tuple, JaxGame] = {}
+
+
 def make_game(name: str, **kwargs) -> JaxGame:
-  """Constructs a game by its name."""
+  """The game of the given name and parameters, shared by all the callers."""
   games = {
       "goofspiel": JaxGoofspiel,
       "goofspiel_random": JaxRandomGoofspiel,
@@ -17,4 +22,7 @@ def make_game(name: str, **kwargs) -> JaxGame:
   }
   if name not in games:
     raise ValueError(f"Unknown game {name}, available: {list(games)}")
-  return games[name](**kwargs)
+  key = (name, tuple(sorted(kwargs.items())))
+  if key not in _GAMES:
+    _GAMES[key] = games[name](**kwargs)
+  return _GAMES[key]

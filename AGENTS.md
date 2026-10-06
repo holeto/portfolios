@@ -79,6 +79,9 @@ uv run python plotting/plot_nashconv.py --config configs/<name>.yaml
 ## Conventions
 
 - Utilities and values are from the perspective of player 1.
+- Games are immutable: `make_game` shares one instance per name and parameters, so the functions jitted
+  on a game compile once. Jitted functions take networks or games as static arguments, never a solver,
+  which the cache of jit would keep alive.
 - Games are simultaneous-move. Turn-based games give the non-acting player the single
   legal dummy action 0. In chance nodes player 2 "plays" the outcomes (outcome k is
   action k) and player 1 has the dummy action.
